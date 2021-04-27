@@ -21,6 +21,7 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	natsd "github.com/nats-io/nats-server/v2/server"
@@ -30,11 +31,12 @@ import (
 
 // Routes for the monitoring pages
 const (
-	RootPath     = "/streaming"
-	ServerPath   = RootPath + "/serverz"
-	StorePath    = RootPath + "/storez"
-	ClientsPath  = RootPath + "/clientsz"
-	ChannelsPath = RootPath + "/channelsz"
+	RootPath       = "/streaming"
+	ServerPath     = RootPath + "/serverz"
+	StorePath      = RootPath + "/storez"
+	ClientsPath    = RootPath + "/clientsz"
+	ChannelsPath   = RootPath + "/channelsz"
+	IsFTActivePath = RootPath + "/isFTActive"
 
 	defaultMonitorListLimit = 1024
 )
@@ -47,6 +49,7 @@ type Serverz struct {
 	GoVersion     string    `json:"go"`
 	State         string    `json:"state"`
 	Role          string    `json:"role,omitempty"`
+	NodeID        string    `json:"node_id,omitempty"`
 	Now           time.Time `json:"now"`
 	Start         time.Time `json:"start_time"`
 	Uptime        string    `json:"uptime"`
@@ -55,6 +58,10 @@ type Serverz struct {
 	Channels      int       `json:"channels"`
 	TotalMsgs     int       `json:"total_msgs"`
 	TotalBytes    uint64    `json:"total_bytes"`
+	InMsgs        int64     `json:"in_msgs"`
+	InBytes       int64     `json:"in_bytes"`
+	OutMsgs       int64     `json:"out_msgs"`
+	OutBytes      int64     `json:"out_bytes"`
 	OpenFDs       int       `json:"open_fds,omitempty"`
 	MaxFDs        int       `json:"max_fds,omitempty"`
 }
@@ -86,6 +93,7 @@ type Clientsz struct {
 type Clientz struct {
 	ID            string                      `json:"id"`
 	HBInbox       string                      `json:"hb_inbox"`
+	SubsCount     int                         `json:"subs_count"`
 	Subscriptions map[string][]*Subscriptionz `json:"subscriptions,omitempty"`
 }
 
@@ -109,6 +117,7 @@ type Channelz struct {
 	Bytes         uint64           `json:"bytes"`
 	FirstSeq      uint64           `json:"first_seq"`
 	LastSeq       uint64           `json:"last_seq"`
+	SubsCount     int              `json:"subs_count"`
 	Subscriptions []*Subscriptionz `json:"subscriptions,omitempty"`
 }
 
@@ -155,6 +164,7 @@ func (s *StanServer) startMonitoring(nOpts *natsd.Options) error {
 	mux.HandleFunc(StorePath, s.handleStorez)
 	mux.HandleFunc(ClientsPath, s.handleClientsz)
 	mux.HandleFunc(ChannelsPath, s.handleChannelsz)
+	mux.HandleFunc(IsFTActivePath, s.handleIsFTActivez)
 
 	return nil
 }
@@ -171,10 +181,10 @@ func (s *StanServer) handleRootz(w http.ResponseWriter, r *http.Request) {
   <body>
     <img src="http://nats.io/img/logo.png" alt="NATS Streaming">
     <br/>
-	<a href=%s>server</a><br/>
-	<a href=%s>store</a><br/>
-	<a href=%s>clients</a><br/>
-	<a href=%s>channels</a><br/>
+	<a href=.%s>server</a><br/>
+	<a href=.%s>store</a><br/>
+	<a href=.%s>clients</a><br/>
+	<a href=.%s>channels</a><br/>
     <br/>
     <a href=http://nats.io/documentation/server/gnatsd-monitoring/>help</a>
   </body>
@@ -189,10 +199,12 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var role string
+	var nodeID string
 	s.mu.RLock()
 	state := s.state
 	if s.raft != nil {
 		role = s.raft.State().String()
+		nodeID = s.info.NodeID
 	}
 	s.mu.RUnlock()
 
@@ -222,6 +234,7 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		GoVersion:     runtime.Version(),
 		State:         state.String(),
 		Role:          role,
+		NodeID:        nodeID,
 		Now:           now,
 		Start:         s.startTime,
 		Uptime:        myUptime(now.Sub(s.startTime)),
@@ -230,10 +243,25 @@ func (s *StanServer) handleServerz(w http.ResponseWriter, r *http.Request) {
 		Subscriptions: numSubs,
 		TotalMsgs:     count,
 		TotalBytes:    bytes,
+		InMsgs:        atomic.LoadInt64(&s.stats.inMsgs),
+		InBytes:       atomic.LoadInt64(&s.stats.inBytes),
+		OutMsgs:       atomic.LoadInt64(&s.stats.outMsgs),
+		OutBytes:      atomic.LoadInt64(&s.stats.outBytes),
 		OpenFDs:       fds,
 		MaxFDs:        maxFDs,
 	}
 	s.sendResponse(w, r, serverz)
+}
+
+func (s *StanServer) handleIsFTActivez(w http.ResponseWriter, r *http.Request) {
+	s.mu.RLock()
+	state := s.state
+	s.mu.RUnlock()
+	if state == FTActive {
+		w.WriteHeader(http.StatusOK)
+	} else {
+		w.WriteHeader(http.StatusNoContent)
+	}
 }
 
 func myUptime(d time.Duration) string {
@@ -309,13 +337,14 @@ func (s *StanServer) handleClientsz(w http.ResponseWriter, r *http.Request) {
 
 		// Since clients may be unregistered between the time we get the client IDs
 		// and the time we build carr array, lets count the number of elements
-		// actually intserted.
+		// actually inserted.
 		carrSize := 0
 		for _, c := range carr {
 			client := s.clients.lookup(c.ID)
 			if client != nil {
 				client.RLock()
 				c.HBInbox = client.info.HbInbox
+				c.SubsCount = len(client.subs)
 				if subsOption == 1 {
 					c.Subscriptions = getMonitorClientSubs(client)
 				}
@@ -346,8 +375,9 @@ func getMonitorClient(s *StanServer, clientID string, subsOption int) *Clientz {
 	cli.RLock()
 	defer cli.RUnlock()
 	cz := &Clientz{
-		HBInbox: cli.info.HbInbox,
-		ID:      cli.info.ID,
+		HBInbox:   cli.info.HbInbox,
+		ID:        cli.info.ID,
+		SubsCount: len(cli.subs),
 	}
 	if subsOption == 1 {
 		cz.Subscriptions = getMonitorClientSubs(cli)
@@ -397,6 +427,29 @@ func getMonitorChannelSubs(ss *subStore) []*Subscriptionz {
 		qsub.RUnlock()
 	}
 	return subsz
+}
+
+func getMonitorChannelSubsCount(ss *subStore) int {
+	ss.RLock()
+	defer ss.RUnlock()
+	count := len(ss.psubs)
+	// Get only offline durables (the online also appear in ss.psubs)
+	for _, sub := range ss.durables {
+		if sub.ClientID == "" {
+			count++
+		}
+	}
+	for _, qsub := range ss.qsubs {
+		qsub.RLock()
+		count += len(qsub.subs)
+		// If this is a durable queue subscription and all members
+		// are offline, qsub.shadow will be not nil. Report this one.
+		if qsub.shadow != nil {
+			count++
+		}
+		qsub.RUnlock()
+	}
+	return count
 }
 
 func createSubscriptionz(sub *subState) *Subscriptionz {
@@ -512,9 +565,14 @@ func (s *StanServer) updateChannelz(cz *Channelz, c *channel, subsOption int) er
 	cz.Bytes = bytes
 	cz.FirstSeq = fseq
 	cz.LastSeq = lseq
+	var subsCount int
 	if subsOption == 1 {
 		cz.Subscriptions = getMonitorChannelSubs(c.ss)
+		subsCount = len(cz.Subscriptions)
+	} else {
+		subsCount = getMonitorChannelSubsCount(c.ss)
 	}
+	cz.SubsCount = subsCount
 	return nil
 }
 

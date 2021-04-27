@@ -34,19 +34,43 @@ func (s *StanServer) handleSignals() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, syscall.SIGINT, syscall.SIGTERM, syscall.SIGUSR1, syscall.SIGHUP)
 	go func() {
-		for sig := range c {
-			// Notify will relay only the signals that we have
-			// registered, so we don't need a "default" in the
-			// switch statement.
-			switch sig {
-			case syscall.SIGINT, syscall.SIGTERM:
-				s.Shutdown()
-				os.Exit(0)
-			case syscall.SIGUSR1:
-				// File log re-open for rotating file logs.
-				s.log.ReopenLogFile()
-			case syscall.SIGHUP:
-				// Ignore for now
+		for {
+			select {
+			case sig := <-c:
+				// Notify will relay only the signals that we have
+				// registered, so we don't need a "default" in the
+				// switch statement.
+				switch sig {
+				case syscall.SIGINT:
+					s.Shutdown()
+					os.Exit(0)
+				case syscall.SIGTERM:
+					s.Shutdown()
+					os.Exit(143)
+				case syscall.SIGUSR1:
+					// File log re-open for rotating file logs.
+					s.log.ReopenLogFile()
+				case syscall.SIGHUP:
+					s.mu.Lock()
+					ns := s.natsServer
+					nobr := s.natsOpts
+					s.mu.Unlock()
+					if ns != nil {
+						if err := ns.Reload(); err != nil {
+							s.log.Errorf("Reload: %v", err)
+						} else if fileOpts, err := natsd.ProcessConfigFile(nobr.ConfigFile); err == nil {
+							newOpts := natsd.MergeOptions(fileOpts, nobr)
+							s.mu.Lock()
+							s.natsOpts = newOpts.Clone()
+							s.log.UpdateNATSOptions(s.natsOpts)
+							s.mu.Unlock()
+						}
+					} else {
+						s.log.Warnf("Reload supported only for embedded NATS Server's configuration")
+					}
+				}
+			case <-s.shutdownCh:
+				return
 			}
 		}
 	}()

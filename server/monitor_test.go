@@ -24,6 +24,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,12 +46,12 @@ const (
 )
 
 var defaultMonitorOptions = natsd.Options{
-	Host:     "localhost",
+	Host:     "127.0.0.1",
 	Port:     4222,
 	HTTPHost: monitorHost,
 	HTTPPort: monitorPort,
 	Cluster: natsd.ClusterOpts{
-		Host: "localhost",
+		Host: "127.0.0.1",
 		Port: 6222,
 	},
 	NoLog:  true,
@@ -125,7 +126,7 @@ func TestMonitorStartOwnHTTPServer(t *testing.T) {
 	nOpts.HTTPHost = monitorHost
 	nOpts.HTTPPort = monitorPort
 	sOpts := GetDefaultOptions()
-	sOpts.NATSServerURL = "nats://localhost:4222"
+	sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
 
@@ -148,7 +149,7 @@ func TestMonitorStartOwnHTTPSServer(t *testing.T) {
 	}
 	nOpts.TLSConfig.Certificates = []tls.Certificate{cert}
 	sOpts := GetDefaultOptions()
-	sOpts.NATSServerURL = "nats://localhost:4222"
+	sOpts.NATSServerURL = "nats://127.0.0.1:4222"
 	s := runServerWithOpts(t, sOpts, &nOpts)
 	defer s.Shutdown()
 
@@ -376,6 +377,48 @@ func TestMonitorServerz(t *testing.T) {
 	monitorExpectStatus(t, ServerPath, http.StatusInternalServerError)
 }
 
+func TestMonitorIsFTActiveFTServer(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		checkActive    bool
+		expectedStatus int
+	}{
+		{"active", true, http.StatusOK},
+		{"standby", false, http.StatusNoContent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			resetPreviousHTTPConnections()
+
+			cleanupFTDatastore(t)
+			defer cleanupFTDatastore(t)
+
+			nopts := defaultMonitorOptions
+			var aNOpts *natsd.Options
+			var sNOpts *natsd.Options
+
+			if test.checkActive {
+				aNOpts = &nopts
+			} else {
+				sNOpts = &nopts
+			}
+
+			opts := getTestFTDefaultOptions()
+			active := runServerWithOpts(t, opts, aNOpts)
+			defer active.Shutdown()
+
+			getFTActiveServer(t, active)
+
+			opts = getTestFTDefaultOptions()
+			opts.NATSServerURL = "nats://127.0.0.1:4222"
+			standby := runServerWithOpts(t, opts, sNOpts)
+			defer standby.Shutdown()
+
+			resp, _ := getBodyEx(t, http.DefaultClient, "http", IsFTActivePath, test.expectedStatus, "")
+			defer resp.Body.Close()
+		})
+	}
+}
+
 func TestMonitorUptime(t *testing.T) {
 	expected := []string{"1y2d3h4m5s", "1d2h3m4s", "1h2m3s", "1m2s", "1s"}
 	durations := []time.Duration{
@@ -591,8 +634,9 @@ func TestMonitorClientsz(t *testing.T) {
 			cli := s.clients.lookup(cid)
 			cli.RLock()
 			cz := &Clientz{
-				ID:      cid,
-				HBInbox: cli.info.HbInbox,
+				ID:        cid,
+				HBInbox:   cli.info.HbInbox,
+				SubsCount: len(cli.subs),
 			}
 			if expectSubs {
 				cz.Subscriptions = getCliSubs(cli.subs)
@@ -718,8 +762,9 @@ func TestMonitorClientz(t *testing.T) {
 		}
 		cli.RLock()
 		cz := &Clientz{
-			ID:      cid,
-			HBInbox: cli.info.HbInbox,
+			ID:        cid,
+			HBInbox:   cli.info.HbInbox,
+			SubsCount: len(cli.subs),
 		}
 		if expectSubs {
 			cz.Subscriptions = getCliSubs(cli.subs)
@@ -942,6 +987,7 @@ func TestMonitorChannelsWithSubsz(t *testing.T) {
 					qsub.RUnlock()
 				}
 				ss.RUnlock()
+				channelz.SubsCount = len(subscriptions)
 				channelz.Subscriptions = subscriptions
 				channelsz.Channels = append(channelsz.Channels, channelz)
 			}
@@ -1032,16 +1078,18 @@ func TestMonitorChannelz(t *testing.T) {
 		}
 		msgs, bytes := msgStoreState(t, cs.store.Msgs)
 		firstSeq, lastSeq := msgStoreFirstAndLastSequence(t, cs.store.Msgs)
+		ss := cs.ss
+		subs := getChannelSubs(ss.psubs)
 		channelz := &Channelz{
-			Name:     name,
-			FirstSeq: firstSeq,
-			LastSeq:  lastSeq,
-			Msgs:     msgs,
-			Bytes:    bytes,
+			Name:      name,
+			FirstSeq:  firstSeq,
+			LastSeq:   lastSeq,
+			Msgs:      msgs,
+			Bytes:     bytes,
+			SubsCount: len(subs),
 		}
 		if expectedSubs {
-			ss := cs.ss
-			channelz.Subscriptions = getChannelSubs(ss.psubs)
+			channelz.Subscriptions = subs
 		}
 		return channelz
 	}
@@ -1202,7 +1250,7 @@ func TestMonitorClusterRole(t *testing.T) {
 			s2 := runServerWithOpts(t, s2sOpts, test.n2Opts)
 			defer s2.Shutdown()
 
-			getLeader(t, 10*time.Second, s1, s2)
+			l := getLeader(t, 10*time.Second, s1, s2)
 
 			resp, body := getBody(t, ServerPath, expectedJSON)
 			resp.Body.Close()
@@ -1211,7 +1259,18 @@ func TestMonitorClusterRole(t *testing.T) {
 				t.Fatalf("Got an error unmarshalling the body: %v", err)
 			}
 			if sz.Role != test.expectedRole {
-				t.Fatalf("Expected role to be %v, gt %v", test.expectedRole, sz.Role)
+				t.Fatalf("Expected role to be %v, got %v", test.expectedRole, sz.Role)
+			}
+			var nodeID string
+			if test.name == "leader" {
+				nodeID = l.info.NodeID
+			} else if l == s1 {
+				nodeID = s2.info.NodeID
+			} else {
+				nodeID = s1.info.NodeID
+			}
+			if sz.NodeID != nodeID {
+				t.Fatalf("Expected nodeID to be %q, got %q", nodeID, sz.NodeID)
 			}
 		})
 	}
@@ -1325,4 +1384,67 @@ func TestMonitorNumSubs(t *testing.T) {
 	qsub1.Unsubscribe()
 	dur.Unsubscribe()
 	checkNumSubs(t, 0)
+}
+
+func TestMonitorInOutMsgs(t *testing.T) {
+	resetPreviousHTTPConnections()
+	s := runMonitorServer(t, GetDefaultOptions())
+	defer s.Shutdown()
+
+	sc := NewDefaultConnection(t)
+	defer sc.Close()
+
+	mch := make(chan *stan.Msg, 5)
+	count := int32(0)
+	if _, err := sc.Subscribe("foo", func(m *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+		if !m.Redelivered {
+			select {
+			case mch <- m:
+			default:
+			}
+		}
+	},
+		stan.SetManualAckMode(),
+		stan.AckWait(ackWaitInMs(500))); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	if _, err := sc.Subscribe("foo", func(_ *stan.Msg) {
+		atomic.AddInt32(&count, 1)
+	}); err != nil {
+		t.Fatalf("Error on subscribe: %v", err)
+	}
+
+	for i := 0; i < 5; i++ {
+		sc.Publish("foo", []byte("msg"))
+	}
+
+	resp, body := getBody(t, ServerPath, expectedJSON)
+	resp.Body.Close()
+	sz := Serverz{}
+	if err := json.Unmarshal(body, &sz); err != nil {
+		t.Fatalf("Got an error unmarshalling the body: %v", err)
+	}
+	if sz.InMsgs != 5 || sz.InBytes == 0 {
+		t.Fatalf("Expected 5 inbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+	if sz.OutMsgs != 10 || sz.OutBytes == 0 {
+		t.Fatalf("Expected 10 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+
+	time.Sleep(700 * time.Millisecond)
+
+	resp, body = getBody(t, ServerPath, expectedJSON)
+	resp.Body.Close()
+	sz = Serverz{}
+	if err := json.Unmarshal(body, &sz); err != nil {
+		t.Fatalf("Got an error unmarshalling the body: %v", err)
+	}
+	if sz.InMsgs != 5 || sz.InBytes == 0 {
+		t.Fatalf("Expected 5 inbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
+	if sz.OutMsgs != 15 || sz.OutBytes == 0 {
+		t.Fatalf("Expected 15 outbound messages, got %v - %v", sz.InMsgs, sz.InBytes)
+	}
 }

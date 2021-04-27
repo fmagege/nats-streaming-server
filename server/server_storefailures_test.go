@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -41,6 +41,7 @@ type mockedSubStore struct {
 	sync.RWMutex
 	fail          bool
 	failFlushOnce bool
+	ch            chan bool
 }
 
 func (ms *mockedStore) CreateChannel(name string) (*stores.Channel, error) {
@@ -214,9 +215,15 @@ func TestMsgLookupFailures(t *testing.T) {
 	sub.Unsubscribe()
 
 	// Create subscription, manual ack mode, don't ack, wait for redelivery
-	sub, err = sc.Subscribe("foo", func(_ *stan.Msg) {
-		rcvCh <- true
-	}, stan.DeliverAllAvailable(), stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(15)))
+	rdlvCh := make(chan bool)
+	sub, err = sc.Subscribe("foo", func(m *stan.Msg) {
+		if !m.Redelivered {
+			rcvCh <- true
+		} else if m.RedeliveryCount == 3 {
+			rdlvCh <- true
+			m.Ack()
+		}
+	}, stan.DeliverAllAvailable(), stan.SetManualAckMode(), stan.AckWait(ackWaitInMs(50)))
 	if err != nil {
 		t.Fatalf("Error on subscribe: %v", err)
 	}
@@ -247,13 +254,25 @@ func TestMsgLookupFailures(t *testing.T) {
 	mms.Lock()
 	mms.fail = false
 	mms.Unlock()
+
+	// Now make sure that we do get it redelivered when the error clears
+	select {
+	case <-rdlvCh:
+	case <-time.After(time.Second):
+		t.Fatal("Redelivery should have continued until error cleared")
+	}
 	sub.Unsubscribe()
 }
 
 func (ss *mockedSubStore) CreateSub(sub *spb.SubState) error {
 	ss.RLock()
 	fail := ss.fail
+	ch := ss.ch
 	ss.RUnlock()
+	if ch != nil {
+		// Wait for notification that we can continue
+		<-ch
+	}
 	if fail {
 		return fmt.Errorf("On purpose")
 	}
@@ -338,6 +357,9 @@ func TestDeleteSubFailures(t *testing.T) {
 	// Produce a message to this durable queue sub
 	if err := sc.Publish("foo", []byte("hello")); err != nil {
 		t.Fatalf("Error on publish: %v", err)
+	}
+	if err := Wait(ch); err != nil {
+		t.Fatal("Did not get our message")
 	}
 	// Create 2 more durable queue subs
 	dqsub2, err := sc.QueueSubscribe("foo", "dqueue", func(_ *stan.Msg) {},

@@ -1,4 +1,4 @@
-// Copyright 2018 The NATS Authors
+// Copyright 2018-2020 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,12 +27,12 @@ import (
 	"github.com/nats-io/nats-streaming-server/stores"
 )
 
-func createTestRaftLog(t tLogger, sync bool, trailingLogs int) *raftLog {
+func createTestRaftLog(t tLogger, opts *Options) *raftLog {
 	if err := os.MkdirAll(defaultRaftLog, os.ModeDir+os.ModePerm); err != nil {
 		stackFatalf(t, "Unable to create raft log directory: %v", err)
 	}
 	fileName := filepath.Join(defaultRaftLog, raftLogFile)
-	store, err := newRaftLog(testLogger, fileName, sync, trailingLogs, false, stores.CryptoCipherAutoSelect, nil)
+	store, err := newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		stackFatalf(t, "Error creating store: %v", err)
 	}
@@ -44,7 +44,7 @@ func TestRaftLogDeleteRange(t *testing.T) {
 	defer cleanupRaftLog(t)
 
 	// No sync (will check that conn's NoSync value is correct after a recreating the file)
-	store := createTestRaftLog(t, false, 0)
+	store := createTestRaftLog(t, nil)
 	defer store.Close()
 
 	// Store in dbConf bucket
@@ -145,7 +145,7 @@ func TestRaftLogEncodeDecodeLogs(t *testing.T) {
 	cleanupRaftLog(t)
 	defer cleanupRaftLog(t)
 
-	store := createTestRaftLog(t, false, 0)
+	store := createTestRaftLog(t, nil)
 	defer store.Close()
 
 	total := 50000
@@ -236,7 +236,7 @@ func TestRaftLogWithEncryption(t *testing.T) {
 	cleanupRaftLog(t)
 	defer cleanupRaftLog(t)
 
-	store := createTestRaftLog(t, false, 0)
+	store := createTestRaftLog(t, nil)
 	defer store.Close()
 	// Plain text log
 	store.StoreLog(&raft.Log{Index: 1, Term: 1, Type: raft.LogCommand, Data: []byte("abcd")})
@@ -248,7 +248,11 @@ func TestRaftLogWithEncryption(t *testing.T) {
 	store.Close()
 
 	// Re-open as encrypted store
-	store, err := newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, []byte("testkey"))
+	opts := GetDefaultOptions()
+	opts.Encrypt = true
+	opts.EncryptionCipher = stores.CryptoCipherAES
+	opts.EncryptionKey = []byte("testkey")
+	store, err := newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error opening store: %v", err)
 	}
@@ -275,7 +279,8 @@ func TestRaftLogWithEncryption(t *testing.T) {
 	fileName = filepath.Join(defaultRaftLog, raftLogFile)
 
 	key := []byte("testkey")
-	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, key)
+	opts.EncryptionKey = key
+	store, err = newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -325,7 +330,9 @@ func TestRaftLogWithEncryption(t *testing.T) {
 	if err := os.Setenv(stores.CryptoStoreEnvKeyName, "testkey"); err != nil {
 		t.Fatalf("Unable to set environment variable: %v", err)
 	}
-	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, nil)
+	opts.EncryptionCipher = stores.CryptoCipherAES
+	opts.EncryptionKey = nil
+	store, err = newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -341,7 +348,8 @@ func TestRaftLogWithEncryption(t *testing.T) {
 
 	// Ensure that env key override config by providing a wrong key
 	// and notice that we have correct decrypt.
-	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, []byte("wrongkey"))
+	opts.EncryptionKey = []byte("wrongkey")
+	store, err = newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -357,7 +365,9 @@ func TestRaftLogWithEncryption(t *testing.T) {
 
 	// Now unset env variable and re-open with wrong key
 	os.Unsetenv(stores.CryptoStoreEnvKeyName)
-	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, []byte("wrongkey"))
+	opts.EncryptionCipher = stores.CryptoCipherAES
+	opts.EncryptionKey = []byte("wrongkey")
+	store, err = newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -369,7 +379,8 @@ func TestRaftLogWithEncryption(t *testing.T) {
 	store.Close()
 
 	// Re-open with encryption but no key, this should fail.
-	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAES, nil)
+	opts.EncryptionKey = nil
+	store, err = newRaftLog(testLogger, fileName, opts)
 	if err == nil || !strings.Contains(err.Error(), stores.ErrCryptoStoreRequiresKey.Error()) {
 		if store != nil {
 			store.Close()
@@ -387,7 +398,9 @@ func TestRaftLogMultipleCiphers(t *testing.T) {
 	}
 	fileName := filepath.Join(defaultRaftLog, raftLogFile)
 
-	store, err := newRaftLog(testLogger, fileName, false, 0, false, stores.CryptoCipherAutoSelect, nil)
+	opts := GetDefaultOptions()
+	opts.EncryptionCipher = stores.CryptoCipherAutoSelect
+	store, err := newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -406,7 +419,11 @@ func TestRaftLogMultipleCiphers(t *testing.T) {
 
 	storeWithEncryption := func(t *testing.T, encryptionCipher string, payloadIdx int) {
 		t.Helper()
-		store, err := newRaftLog(testLogger, fileName, false, 0, true, encryptionCipher, []byte("mykey"))
+		opts := GetDefaultOptions()
+		opts.Encrypt = true
+		opts.EncryptionCipher = encryptionCipher
+		opts.EncryptionKey = []byte("mykey")
+		store, err := newRaftLog(testLogger, fileName, opts)
 		if err != nil {
 			t.Fatalf("Error creating store: %v", err)
 		}
@@ -422,7 +439,11 @@ func TestRaftLogMultipleCiphers(t *testing.T) {
 
 	// Now re-open with any cipher, use the auto-select one.
 	// We should be able to get all 3 messages correctly.
-	store, err = newRaftLog(testLogger, fileName, false, 0, true, stores.CryptoCipherAutoSelect, []byte("mykey"))
+	opts = GetDefaultOptions()
+	opts.Encrypt = true
+	opts.EncryptionCipher = stores.CryptoCipherAutoSelect
+	opts.EncryptionKey = []byte("mykey")
+	store, err = newRaftLog(testLogger, fileName, opts)
 	if err != nil {
 		t.Fatalf("Error creating store: %v", err)
 	}
@@ -435,5 +456,170 @@ func TestRaftLogMultipleCiphers(t *testing.T) {
 		if !bytes.Equal(l.Data, payloads[i]) {
 			t.Fatalf("Expected message %q, got %q", payloads[i], l.Data)
 		}
+	}
+}
+
+func TestRaftLogChannelID(t *testing.T) {
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	store := createTestRaftLog(t, nil)
+	defer store.Close()
+
+	storeID := func(name string, id uint64) {
+		t.Helper()
+		if err := store.SetChannelID(name, id); err != nil {
+			t.Fatalf("Error storing channel ID: %v", err)
+		}
+	}
+	getID := func(name string, expected uint64) {
+		t.Helper()
+		if id, err := store.GetChannelID(name); err != nil || id != expected {
+			t.Fatalf("Expected ID for %q to be %v, got %v (err=%v)", name, expected, id, err)
+		}
+	}
+	deleteID := func(name string) {
+		t.Helper()
+		if err := store.DeleteChannelID(name); err != nil {
+			t.Fatalf("Error deleting channel %q id: %v", name, err)
+		}
+	}
+
+	// Store different channels
+	storeID("foo", 1)
+	storeID("bar", 2)
+
+	// Get returns what is expected
+	getID("foo", 1)
+	getID("bar", 2)
+	// Get for unknown channel returns 0, no error
+	getID("baz", 0)
+
+	// Update the ID
+	storeID("foo", 3)
+	// Check that new value is returned
+	getID("foo", 3)
+
+	// Delete a channel
+	deleteID("bar")
+	// and make sure that its ID is now returned as empty but no error
+	getID("bar", 0)
+
+	// Try to delete a channel that does not exist should not report an error
+	deleteID("baz")
+
+	store.Close()
+	store = createTestRaftLog(t, nil)
+	defer store.Close()
+
+	// Make sure that last ID is returned
+	getID("foo", 3)
+
+	// Recreate this channel with new ID
+	storeID("bar", 4)
+	// ID is as expected
+	getID("bar", 4)
+
+	// Delete all channels
+	deleteID("foo")
+	deleteID("bar")
+
+	store.Close()
+	store = createTestRaftLog(t, nil)
+	defer store.Close()
+
+	// No ID returned
+	getID("foo", 0)
+	getID("bar", 0)
+	getID("baz", 0)
+}
+
+func TestRaftLogCache(t *testing.T) {
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	opts := GetDefaultOptions()
+	opts.Clustering.LogCacheSize = 10
+	store := createTestRaftLog(t, opts)
+	defer store.Close()
+
+	store.RLock()
+	lc := len(store.cache)
+	cs := store.cacheSize
+	store.RUnlock()
+	if lc != 10 {
+		t.Fatalf("Expected cache len to be 10, got %v", lc)
+	}
+	if cs != 10 {
+		t.Fatalf("Expected cacheSize to be 10, got %v", cs)
+	}
+
+	l1 := &raft.Log{Index: 1, Data: []byte("msg1")}
+	if err := store.StoreLog(l1); err != nil {
+		t.Fatalf("Error on store: %v", err)
+	}
+
+	l2 := &raft.Log{Index: 2, Data: []byte("msg2")}
+	l3 := &raft.Log{Index: 3, Data: []byte("msg3")}
+	if err := store.StoreLogs([]*raft.Log{l2, l3}); err != nil {
+		t.Fatalf("Error on store: %v", err)
+	}
+
+	store.RLock()
+	cl1 := store.cache[1%10]
+	cl2 := store.cache[2%10]
+	cl3 := store.cache[3%10]
+	store.RUnlock()
+	if cl1 == nil || cl2 == nil || cl3 == nil || cl1.Index != 1 || cl2.Index != 2 || cl3.Index != 3 {
+		t.Fatalf("Wrong content: l1=%v l2=%v l3=%v", cl1, cl2, cl3)
+	}
+
+	l11 := &raft.Log{Index: 11, Data: []byte("msg11")}
+	if err := store.StoreLog(l11); err != nil {
+		t.Fatalf("Error on store: %v", err)
+	}
+	var cl11 raft.Log
+	if err := store.GetLog(11, &cl11); err != nil || cl11.Index != 11 || string(cl11.Data) != "msg11" {
+		t.Fatalf("Unexpected err=%v msg=%v", err, cl11)
+	}
+
+	if err := store.DeleteRange(1, 2); err != nil {
+		t.Fatalf("Error on delete range: %v", err)
+	}
+	var err error
+	store.RLock()
+	lc = len(store.cache)
+	cs = store.cacheSize
+	for _, l := range store.cache {
+		if l != nil {
+			err = fmt.Errorf("Log still in cache: %v", l)
+			break
+		}
+	}
+	store.RUnlock()
+	if lc != 10 {
+		t.Fatalf("Expected cache len to be 10, got %v", lc)
+	}
+	if cs != 10 {
+		t.Fatalf("Expected cacheSize to be 10, got %v", cs)
+	}
+	if err != nil {
+		t.Fatal(err.Error())
+	}
+
+	// Now cause encoding to fail so that storelog fails and
+	// we check that log was not cached.
+	store.Lock()
+	store.conn.Close()
+	store.Unlock()
+	l4 := &raft.Log{Index: 4, Data: []byte("msg4")}
+	if err := store.StoreLog(l4); err == nil {
+		t.Fatal("Expected error on store")
+	}
+	store.RLock()
+	cl4 := store.cache[4%10]
+	store.RUnlock()
+	if cl4 != nil {
+		t.Fatalf("Expected log 4 not to be cached, got %v", cl4)
 	}
 }

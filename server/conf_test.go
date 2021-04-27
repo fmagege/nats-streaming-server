@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -75,8 +75,26 @@ func TestParseConfig(t *testing.T) {
 	if opts.ClientCA != "/path/to/client/ca_file" {
 		t.Fatalf("Expected ClientCA to be %q, got %q", "/path/to/client/ca_file", opts.ClientCA)
 	}
+	if opts.TLSServerName != "localhost" {
+		t.Fatalf("Expected TLSServerName to be %q, got %q", "localhost", opts.TLSServerName)
+	}
+	if !opts.TLSSkipVerify {
+		t.Fatalf("Expected TLSSkipVerify to be true, got %v", opts.TLSSkipVerify)
+	}
 	if opts.NATSCredentials != "credentials.creds" {
 		t.Fatalf("Expected Credentials to be %q, got %q", "credentials.creds", opts.NATSCredentials)
+	}
+	if opts.Username != "user" {
+		t.Fatalf("Expected Username to be %q, got %q", "user", opts.Username)
+	}
+	if opts.Password != "password" {
+		t.Fatalf("Expected Password to be %q, got %q", "password", opts.Password)
+	}
+	if opts.NKeySeedFile != "seedfile" {
+		t.Fatalf("Expected NKeySeedFile to be %q, got %q", "seedfile", opts.NKeySeedFile)
+	}
+	if opts.Token != "token" {
+		t.Fatalf("Expected Token to be %q, got %q", "token", opts.Token)
 	}
 	if !opts.FileStoreOpts.CompactEnabled {
 		t.Fatalf("Expected CompactEnabled to be true, got false")
@@ -221,6 +239,9 @@ func TestParseConfig(t *testing.T) {
 			t.Fatalf("Expected peer %q, got %q", peers[i], p)
 		}
 	}
+	if !opts.Clustering.ProceedOnRestoreFailure {
+		t.Fatalf("Expected ProceedOnRestoreFailure to be true, got false")
+	}
 	if opts.Clustering.RaftLogPath != "/path/to/log" {
 		t.Fatalf("Expected RaftLogPath to be %q, got %q", "/path/to/log", opts.Clustering.RaftLogPath)
 	}
@@ -251,6 +272,18 @@ func TestParseConfig(t *testing.T) {
 	if opts.Clustering.RaftCommitTimeout != 50*time.Millisecond {
 		t.Fatalf("Expected RaftCommitTimeout to be 50ms, got %v", opts.Clustering.RaftCommitTimeout)
 	}
+	if !opts.Clustering.AllowAddRemoveNode {
+		t.Fatal("Expected AllowAddRemoveNode to be true")
+	}
+	if !opts.Clustering.BoltFreeListSync {
+		t.Fatal("Expected BoltFreeListSync to be true")
+	}
+	if !opts.Clustering.BoltFreeListMap {
+		t.Fatal("Expected BoltFreeListMap to be true")
+	}
+	if !opts.Clustering.NodesConnections {
+		t.Fatal("Expected NodesConnections to be true")
+	}
 	if opts.SQLStoreOpts.Driver != "mysql" {
 		t.Fatalf("Expected SQL Driver to be %q, got %q", "mysql", opts.SQLStoreOpts.Driver)
 	}
@@ -262,6 +295,9 @@ func TestParseConfig(t *testing.T) {
 	}
 	if opts.SQLStoreOpts.MaxOpenConns != 5 {
 		t.Fatalf("Expected SQL MaxOpenConns to be 5, got %v", opts.SQLStoreOpts.MaxOpenConns)
+	}
+	if opts.SQLStoreOpts.BulkInsertLimit != 1000 {
+		t.Fatalf("Expected SQL BulkInsertLimit to be 1000, got %v", opts.SQLStoreOpts.BulkInsertLimit)
 	}
 	if !opts.Encrypt {
 		t.Fatal("Expected Encrypt to be true")
@@ -416,6 +452,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "ft_group: 123", wrongTypeErr)
 	expectFailureFor(t, "partitioning: 123", wrongTypeErr)
 	expectFailureFor(t, "syslog_name: 123", wrongTypeErr)
+	expectFailureFor(t, "replace_durable: 123", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_channels:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_msgs:false}", wrongTypeErr)
 	expectFailureFor(t, "store_limits:{max_bytes:false}", wrongTypeErr)
@@ -438,6 +475,8 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "tls:{client_cert:123}", wrongTypeErr)
 	expectFailureFor(t, "tls:{client_key:123}", wrongTypeErr)
 	expectFailureFor(t, "tls:{client_ca:123}", wrongTypeErr)
+	expectFailureFor(t, "tls:{server_name:123}", wrongTypeErr)
+	expectFailureFor(t, "tls:{insecure:123}", wrongTypeErr)
 	expectFailureFor(t, "file:{compact:123}", wrongTypeErr)
 	expectFailureFor(t, "file:{compact_frag:false}", wrongTypeErr)
 	expectFailureFor(t, "file:{compact_interval:false}", wrongTypeErr)
@@ -464,6 +503,7 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "cluster:{log_snapshots:false}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{trailing_logs:false}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{sync:1}", wrongTypeErr)
+	expectFailureFor(t, "cluster:{proceed_on_restore_failure:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_logging:1}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_heartbeat_timeout:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_heartbeat_timeout:\"not_a_time\"}", wrongTimeErr)
@@ -473,6 +513,9 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "cluster:{raft_lease_timeout:\"not_a_time\"}", wrongTimeErr)
 	expectFailureFor(t, "cluster:{raft_commit_timeout:123}", wrongTypeErr)
 	expectFailureFor(t, "cluster:{raft_commit_timeout:\"not_a_time\"}", wrongTimeErr)
+	expectFailureFor(t, "cluster:{allow_add_remove_node:1}", wrongTypeErr)
+	expectFailureFor(t, "cluster:{bolt_free_list_sync:123}", wrongTypeErr)
+	expectFailureFor(t, "cluster:{bolt_free_list_map:123}", wrongTypeErr)
 	expectFailureFor(t, "sql:{driver:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{source:false}", wrongTypeErr)
 	expectFailureFor(t, "sql:{no_caching:123}", wrongTypeErr)
@@ -481,6 +524,10 @@ func TestParseWrongTypes(t *testing.T) {
 	expectFailureFor(t, "encryption_cipher: 123", wrongTypeErr)
 	expectFailureFor(t, "encryption_key: 123", wrongTypeErr)
 	expectFailureFor(t, "credentials: 123", wrongTypeErr)
+	expectFailureFor(t, "username: 123", wrongTypeErr)
+	expectFailureFor(t, "password: 123", wrongTypeErr)
+	expectFailureFor(t, "token: 123", wrongTypeErr)
+	expectFailureFor(t, "nkey_seed_file: 123", wrongTypeErr)
 }
 
 func expectFailureFor(t *testing.T, content, errorMatch string) {

@@ -1,4 +1,4 @@
-// Copyright 2016-2019 The NATS Authors
+// Copyright 2016-2021 The NATS Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,7 +20,9 @@ import (
 	"io/ioutil"
 	"os"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +30,7 @@ import (
 	"time"
 
 	natsd "github.com/nats-io/nats-server/v2/server"
+	natsdTest "github.com/nats-io/nats-server/v2/test"
 	"github.com/nats-io/nats-streaming-server/logger"
 	"github.com/nats-io/nats-streaming-server/stores"
 	"github.com/nats-io/nats-streaming-server/test"
@@ -186,6 +189,8 @@ func init() {
 func stackFatalf(t tLogger, f string, args ...interface{}) {
 	msg := fmt.Sprintf(f, args...) + "\n" + stack()
 	t.Fatalf(msg)
+	// For staticcheck SA0511...
+	panic("unreachable code")
 }
 
 func stack() string {
@@ -404,6 +409,28 @@ func createConnectionWithNatsOpts(t tLogger, clientName string,
 	return sc, nc
 }
 
+func createConfFile(t *testing.T, content []byte) string {
+	t.Helper()
+	conf, err := ioutil.TempFile("", "")
+	if err != nil {
+		t.Fatalf("Error creating conf file: %v", err)
+	}
+	fName := conf.Name()
+	conf.Close()
+	if err := ioutil.WriteFile(fName, content, 0666); err != nil {
+		os.Remove(fName)
+		t.Fatalf("Error writing conf file: %v", err)
+	}
+	return fName
+}
+
+func changeCurrentConfigContentWithNewContent(t *testing.T, curConfig string, content []byte) {
+	t.Helper()
+	if err := ioutil.WriteFile(curConfig, content, 0666); err != nil {
+		t.Fatalf("Error writing config: %v", err)
+	}
+}
+
 func NewDefaultConnection(t tLogger) stan.Conn {
 	sc, err := stan.Connect(clusterName, clientName)
 	if err != nil {
@@ -432,8 +459,8 @@ func getTestDefaultOptsForPersistentStore() *Options {
 	case stores.TypeFile:
 		opts.FilestoreDir = defaultDataStore
 		opts.FileStoreOpts.BufferSize = 1024
-		// Go 1.12 on macOS is very slow at doing sync writes...
-		if runtime.GOOS == "darwin" && strings.HasPrefix(runtime.Version(), "go1.12") {
+		// Since Go 1.12, on macOS it is very slow to do sync writes...
+		if runtime.GOOS == "darwin" {
 			opts.FileStoreOpts.DoSync = false
 		}
 	case stores.TypeSQL:
@@ -978,20 +1005,24 @@ func TestProtocolOrder(t *testing.T) {
 
 			// Mix pub and subscribe calls
 			ch = make(chan bool)
-			errCh = make(chan error)
+			errCh = make(chan error, 1)
 			startSubAt := 50
 			var sub stan.Subscription
 			var err error
+			first := true
 			for i := 1; i <= 100; i++ {
 				if err := sc.Publish("foo", []byte("hello")); err != nil {
 					t.Fatalf("Unexpected error on publish: %v", err)
 				}
 				if i == startSubAt {
 					sub, err = sc.Subscribe("foo", func(m *stan.Msg) {
-						if m.Sequence == uint64(startSubAt)+1 {
-							ch <- true
-						} else if len(errCh) == 0 {
-							errCh <- fmt.Errorf("Received message %v instead of %v", m.Sequence, startSubAt+1)
+						if first {
+							if m.Sequence == uint64(startSubAt)+1 {
+								ch <- true
+							} else {
+								errCh <- fmt.Errorf("Received message %v instead of %v", m.Sequence, startSubAt+1)
+							}
+							first = false
 						}
 					})
 					if err != nil {
@@ -1010,6 +1041,7 @@ func TestProtocolOrder(t *testing.T) {
 			sub.Unsubscribe()
 
 			// Acks should be processed before Connection close
+			errCh = make(chan error, 1)
 			for i := 0; i < total; i++ {
 				rcv := int32(0)
 				sc2, err := stan.Connect(clusterName, "otherclient")
@@ -1122,10 +1154,12 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer nc.Close()
 	sc, err := stan.Connect(clusterName, clientName, stan.NatsConn(nc))
 	if err != nil {
 		t.Fatalf("Error on connect: %v", err)
 	}
+	defer sc.Close()
 	// Since server is expected to crash, do not attempt to close sc
 	// because it would delay test by 2 seconds.
 
@@ -1146,8 +1180,8 @@ func TestDontSendEmptyMsgProto(t *testing.T) {
 
 	m := &pb.MsgProto{}
 	sub.Lock()
+	defer sub.Unlock()
 	s.sendMsgToSub(sub, m, false)
-	sub.Unlock()
 }
 
 func TestMsgsNotSentToSubBeforeSubReqResponse(t *testing.T) {
@@ -1364,5 +1398,310 @@ func TestAckProcessedBeforeClose(t *testing.T) {
 			t.Fatalf("Error on subscribe: %v", err)
 		}
 		dur.Unsubscribe()
+	}
+}
+
+func TestServerRandomPort(t *testing.T) {
+	natsOpts := natsdTest.DefaultTestOptions
+	natsOpts.Port = natsd.RANDOM_PORT
+	opts := GetDefaultOptions()
+	s := runServerWithOpts(t, opts, &natsOpts)
+	defer s.Shutdown()
+
+	if natsOpts.Port == natsd.RANDOM_PORT {
+		t.Fatal("port was not updated")
+	}
+	s.Shutdown()
+
+	// Try with no nats options provided to make sure we don't
+	// access natsOpts without checking that it is not nil
+	s = runServerWithOpts(t, opts, nil)
+	s.Shutdown()
+}
+
+func TestServerRandomClientURL(t *testing.T) {
+	// Try with an embedded server.
+	natsOpts := natsdTest.DefaultTestOptions
+	natsOpts.Port = natsd.RANDOM_PORT
+	opts := GetDefaultOptions()
+	s := runServerWithOpts(t, opts, &natsOpts)
+	clientURL := s.ClientURL()
+	defer s.Shutdown()
+
+	re := regexp.MustCompile(":[0-9]+$")
+	portString := re.FindString(clientURL)
+	if len(portString) == 3 {
+		t.Fatal("could not locate port in clientURL")
+	}
+
+	urlPort, err := strconv.Atoi(portString[1:])
+	if err != nil {
+		t.Fatal("failed to convert clientURL to integer")
+	}
+
+	if natsOpts.Port != urlPort {
+		t.Fatal("options port did not match clientURL port")
+	}
+	s.Shutdown()
+
+	// Try with remote server
+	natsOpts = natsdTest.DefaultTestOptions
+	natsOpts.Port = natsd.RANDOM_PORT
+	ns := natsdTest.RunServer(&natsOpts)
+	defer ns.Shutdown()
+
+	opts.NATSServerURL = fmt.Sprintf("nats://%s:%d", natsOpts.Host, natsOpts.Port)
+	s = runServerWithOpts(t, opts, nil)
+	defer s.Shutdown()
+
+	clientURL = s.ClientURL()
+	portString = re.FindString(clientURL)
+	if len(portString) == 3 {
+		t.Fatal("could not locate port in clientURL")
+	}
+
+	urlPort, err = strconv.Atoi(portString[1:])
+	if err != nil {
+		t.Fatal("failed to convert clientURL to integer")
+	}
+
+	if natsOpts.Port != urlPort {
+		t.Fatal("options port did not match clientURL port")
+	}
+}
+
+func TestServerAuthInConfig(t *testing.T) {
+	conf := createConfFile(t, []byte(`
+		authorization {
+			users [
+				{user: foo, password: bar}
+			]
+		}
+		streaming {
+			username: foo
+			password: bar
+		}
+	`))
+	defer os.Remove(conf)
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	noPrint := func() {}
+	sopts, nopts, err := ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s := runServerWithOpts(t, sopts, nopts)
+	s.Shutdown()
+	s = nil
+
+	// Check that command line still takes precedence
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf, "-user", "foo", "-pass", "wrong"}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s, err = RunServerWithOpts(sopts, nopts)
+	if err == nil {
+		if s != nil {
+			s.Shutdown()
+		}
+		t.Fatal("Expected to fail to start")
+	}
+
+	conf = createConfFile(t, []byte(`
+		authorization {
+			token: mytoken
+		}
+		streaming {
+			token: mytoken
+		}
+	`))
+	defer os.Remove(conf)
+
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s = runServerWithOpts(t, sopts, nopts)
+	s.Shutdown()
+
+	// For token, the authorization{ token: <value> } is replaced with value passed by `-auth`
+	// and also used to connect. So the test here shows that if `-auth` is specified, it
+	// will both use this as the authentication token and use that to create the connections.
+	// We show that streaming { token: wrong } does not prevent from running.
+	conf = createConfFile(t, []byte(`
+		streaming {
+			token: ignored_because_command_line_is_used
+		}
+	`))
+	defer os.Remove(conf)
+
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf, "-auth", "realtoken"}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s = runServerWithOpts(t, sopts, nopts)
+	defer s.Shutdown()
+
+	// Check that NATS connection really need to provide "realtoken" as authentication token.
+	nc, err := nats.Connect(nats.DefaultURL)
+	if err == nil {
+		if nc != nil {
+			nc.Close()
+		}
+		t.Fatal("Should not have connected")
+	}
+	nc, err = nats.Connect(nats.DefaultURL, nats.Token("realtoken"))
+	if err != nil {
+		t.Fatalf("Error connecting: %v", err)
+	}
+	nc.Close()
+}
+
+func TestServerAuthNKey(t *testing.T) {
+	nkeyfile := createConfFile(t, []byte(`
+-----BEGIN USER NKEY SEED-----
+SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY
+------END USER NKEY SEED------
+	`))
+	defer os.Remove(nkeyfile)
+
+	conf := createConfFile(t, []byte(fmt.Sprintf(`
+		authorization {
+			users [
+				# Streaming Server
+				{nkey: UDXU4RCSJNZOIQHZNWXHXORDPRTGNJAHAHFRGZNEEJCPQTT2M7NLCNF4}
+				# Some other user
+				{nkey: UCNGL4W5QX66CFX6A6DCBVDH5VOHMI7B2UZZU7TXAUQQSI2JPHULCKBR}
+			]
+		}
+		streaming {
+			nkey_seed_file: '%s'
+		}
+	`, nkeyfile)))
+	defer os.Remove(conf)
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	noPrint := func() {}
+	sopts, nopts, err := ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s := runServerWithOpts(t, sopts, nopts)
+	s.Shutdown()
+	s = nil
+
+	// Check that it fails with wrong seed
+	changeCurrentConfigContentWithNewContent(t, nkeyfile, []byte(`
+-----BEGIN USER NKEY SEED-----
+SUAKYRHVIOREXV7EUZTBHUHL7NUMHPMAS7QMDU3GTIUWEI5LDNOXD43IZY
+------END USER NKEY SEED------
+	`))
+	fs = flag.NewFlagSet("test", flag.ContinueOnError)
+	sopts, nopts, err = ConfigureOptions(fs, []string{"-c", conf}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s, err = RunServerWithOpts(sopts, nopts)
+	if err == nil {
+		if s != nil {
+			s.Shutdown()
+		}
+		t.Fatal("Expected failure to start")
+	}
+}
+
+func TestFileSliceMaxBytesCmdLine(t *testing.T) {
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	noPrint := func() {}
+	sopts, nopts, err := ConfigureOptions(fs, []string{"-store", "file", "-dir", defaultDataStore, "-file_slice_max_bytes", "0"}, noPrint, noPrint, noPrint)
+	if err != nil {
+		t.Fatalf("Error on configure: %v", err)
+	}
+	s := runServerWithOpts(t, sopts, nopts)
+	defer s.Shutdown()
+
+	s.mu.Lock()
+	smb := s.opts.FileStoreOpts.SliceMaxBytes
+	s.mu.Unlock()
+	if smb != 0 {
+		t.Fatalf("Expected value to be 0, got %v", smb)
+	}
+}
+
+func TestInternalSubsLimits(t *testing.T) {
+	setPartitionsVarsForTest()
+	defer resetDefaultPartitionsVars()
+
+	cleanupDatastore(t)
+	defer cleanupDatastore(t)
+	cleanupRaftLog(t)
+	defer cleanupRaftLog(t)
+
+	for _, test := range []struct {
+		name string
+		opts func() *Options
+	}{
+		{"regular", func() *Options { return GetDefaultOptions() }},
+		{"partition", func() *Options {
+			o := GetDefaultOptions()
+			o.Partitioning = true
+			o.AddPerChannel("foo", &stores.ChannelLimits{})
+			o.AddPerChannel("bar", &stores.ChannelLimits{})
+			return o
+		}},
+		{"ft", func() *Options { return getTestFTDefaultOptions() }},
+		{"clustered", func() *Options { return getTestDefaultOptsForClustering("a", true) }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "clustered" {
+				ns := natsdTest.RunDefaultServer()
+				defer ns.Shutdown()
+			}
+			o := test.opts()
+			s := runServerWithOpts(t, o, nil)
+			defer s.Shutdown()
+
+			switch test.name {
+			case "clustered":
+				getLeader(t, time.Second, s)
+			case "ft":
+				getFTActiveServer(t, s)
+			default:
+			}
+
+			s.mu.Lock()
+			defer s.mu.Unlock()
+
+			subs := []*nats.Subscription{
+				s.connectSub,
+				s.pubSub,
+				s.subUnsubSub,
+				s.subCloseSub,
+				s.closeSub,
+				s.cliPingSub,
+				s.addNodeSub,
+				s.rmNodeSub,
+			}
+			for _, sub := range subs {
+				// sub can be nil depending on the running mode.
+				if sub == nil {
+					continue
+				}
+				if count, sz, err := sub.PendingLimits(); err != nil || count != -1 || sz != -1 {
+					t.Fatalf("Unexpected values for sub on %q: err=%v count=%v sz=%v",
+						sub.Subject, err, count, sz)
+				}
+			}
+			// The subscription on "client subscription requests" should not be unlimited.
+			if count, sz, err := s.subSub.PendingLimits(); err != nil || count == -1 || sz == -1 {
+				t.Fatalf("The subSub subscription should not be unlimited: err=%v count=%v sz=%v", err, count, sz)
+			}
+		})
 	}
 }

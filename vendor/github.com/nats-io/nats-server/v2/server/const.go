@@ -40,7 +40,7 @@ var (
 
 const (
 	// VERSION is the current version for the server.
-	VERSION = "2.0.4"
+	VERSION = "2.1.9"
 
 	// PROTO is the currently supported protocol.
 	// 0 was the original
@@ -96,6 +96,9 @@ const (
 
 	// DEFAULT_HTTP_PORT is the default monitoring port.
 	DEFAULT_HTTP_PORT = 8222
+
+	// DEFAULT_HTTP_BASE_PATH is the default base path for monitoring.
+	DEFAULT_HTTP_BASE_PATH = "/"
 
 	// ACCEPT_MIN_SLEEP is the minimum acceptable sleep times on temporary errors.
 	ACCEPT_MIN_SLEEP = 10 * time.Millisecond
@@ -175,4 +178,8 @@ const (
 	// DEFAULT_ALLOW_RESPONSE_EXPIRATION is the default time allowed for a given
 	// dynamic response permission.
 	DEFAULT_ALLOW_RESPONSE_EXPIRATION = 2 * time.Minute
+
+	// DEFAULT_SERVICE_LATENCY_SAMPLING is the default sampling rate for service
+	// latency metrics
+	DEFAULT_SERVICE_LATENCY_SAMPLING = 100
 )

@@ -48,22 +48,24 @@ Streaming Server Options:
     -hbt, --hb_timeout <duration>        How long server waits for a heartbeat response
     -hbf, --hb_fail_count <int>          Number of failed heartbeats before server closes the client connection
           --ft_group <string>            Name of the FT Group. A group can be 2 or more servers with a single active server and all sharing the same datastore
-    -sl,  --signal <signal>[=<pid>]      Send signal to nats-streaming-server process (stop, quit, reopen)
+    -sl,  --signal <signal>[=<pid>]      Send signal to nats-streaming-server process (stop, quit, reopen, reload - only for embedded NATS Server)
           --encrypt <bool>               Specify if server should use encryption at rest
           --encryption_cipher <string>   Cipher to use for encryption. Currently support AES and CHAHA (ChaChaPoly). Defaults to AES
-          --encryption_key <sting>       Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
-    
+          --encryption_key <string>      Encryption Key. It is recommended to specify it through the NATS_STREAMING_ENCRYPTION_KEY environment variable instead
+          --replace_durable <bool>       Replace the existing durable subscription instead of reporting a duplicate durable error
+
 Streaming Server Clustering Options:
-    --clustered <bool>                   Run the server in a clustered configuration (default: false)
-    --cluster_node_id <string>           ID of the node within the cluster if there is no stored ID (default: random UUID)
-    --cluster_bootstrap <bool>           Bootstrap the cluster if there is no existing state by electing self as leader (default: false)
-    --cluster_peers <string, ...>        Comma separated list of cluster peer node IDs to bootstrap cluster state
-    --cluster_log_path <string>          Directory to store log replication data
-    --cluster_log_cache_size <int>       Number of log entries to cache in memory to reduce disk IO (default: 512)
-    --cluster_log_snapshots <int>        Number of log snapshots to retain (default: 2)
-    --cluster_trailing_logs <int>        Number of log entries to leave after a snapshot and compaction
-    --cluster_sync <bool>                Do a file sync after every write to the replication log and message store
-    --cluster_raft_logging <bool>        Enable logging from the Raft library (disabled by default)
+    --clustered <bool>                     Run the server in a clustered configuration (default: false)
+    --cluster_node_id <string>             ID of the node within the cluster if there is no stored ID (default: random UUID)
+    --cluster_bootstrap <bool>             Bootstrap the cluster if there is no existing state by electing self as leader (default: false)
+    --cluster_peers <string, ...>          Comma separated list of cluster peer node IDs to bootstrap cluster state
+    --cluster_log_path <string>            Directory to store log replication data
+    --cluster_log_cache_size <int>         Number of log entries to cache in memory to reduce disk IO (default: 512)
+    --cluster_log_snapshots <int>          Number of log snapshots to retain (default: 2)
+    --cluster_trailing_logs <int>          Number of log entries to leave after a snapshot and compaction
+    --cluster_sync <bool>                  Do a file sync after every write to the replication log and message store
+    --cluster_raft_logging <bool>          Enable logging from the Raft library (disabled by default)
+    --cluster_allow_add_remove_node <bool> Enable the ability to send NATS requests to the leader to add/remove cluster nodes
 
 Streaming Server File Store Options:
     --file_compact_enabled <bool>        Enable file compaction
@@ -89,6 +91,7 @@ Streaming Server SQL Store Options:
     --sql_source <string>            Datasource used when opening an SQL connection to the database
     --sql_no_caching <bool>          Enable/Disable caching for improved performance
     --sql_max_open_conns <int>       Maximum number of opened connections to the database
+    --sql_bulk_insert_limit <int>    Maximum number of messages stored with a single SQL "INSERT" statement
 
 Streaming Server TLS Options:
     -secure <bool>                   Use a TLS connection to the NATS server without
@@ -115,7 +118,7 @@ Embedded NATS Server Options:
 Logging Options:
     -l, --log <string>               File to redirect log output
     -T, --logtime=<bool>             Timestamp log entries (default: true)
-    -s, --syslog <string>            Enable syslog as log method
+    -s, --syslog <bool>              Enable syslog as log method
     -r, --remote_syslog <string>     Syslog server addr (udp://localhost:514)
     -D, --debug=<bool>               Enable debugging output
     -V, --trace=<bool>               Trace the raw protocol
